@@ -1,0 +1,23 @@
+{
+  "lib/briefcase": {
+    "rev": "2b00819e5694c075a5437a9a0cde109fac0e6578"
+  },
+  "lib/forge-chronicles": {
+    "rev": "d1fb566915f23a01f08747264c56f8925f15751a"
+  },
+  "lib/forge-std": {
+    "rev": "60acb7aaadcce2d68e52986a0a66fe79f07d138f"
+  },
+  "lib/openzeppelin-contracts": {
+    "tag": {
+      "name": "v5.6.1",
+      "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
+    }
+  },
+  "lib/solady": {
+    "tag": {
+      "name": "v0.1.26",
+      "rev": "acd959aa4bd04720d640bf4e6a5c71037510cc4b"
+    }
+  }
+}

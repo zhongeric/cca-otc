@@ -1,46 +1,110 @@
-## Template Repo (Foundry)
+# OTC Sale Vault
 
-[![CI Status](../../actions/workflows/test.yaml/badge.svg)](../../actions)
+ERC4626 vault for trustless OTC token sales via [Uniswap CCA](https://github.com/Uniswap/twap-auction). Replaces intermediary escrow with a smart contract that enforces vesting schedules, milestone-gated redemption, and a seller bond.
 
-This template repo is a quick and easy way to get started with a new Solidity project. It comes with a number of features that are useful for developing and deploying smart contracts. Such as:
+## How It Works
 
-- Pre-commit hooks for formatting, auto generated documentation, and more
-- Various libraries with useful contracts (OpenZeppelin, Solady) and libraries (Deployment log generation, storage checks, deployer templates)
+The vault is deployed as an ERC20 that serves as the `auctionToken` in a CCA auction. Shares are pre-minted to the deployer, who transfers them into the CCA. Buyers receive shares through the auction. The vault starts empty — the seller deposits underlying tokens over time per a predefined milestone schedule. Buyers redeem shares for underlying tokens as milestones unlock.
 
-#### Table of Contents
+A configurable bond (in any ERC20) protects buyers: if the seller misses a milestone deadline, anyone can trigger default, and share holders claim the bond pro-rata.
 
-- [Setup](#setup)
-- [Deployment](#deployment)
-- [Docs](#docs)
-- [Contributing](#contributing)
+## Architecture
 
-## Setup
-
-Follow these steps to set up your local environment:
-
-- [Install foundry](https://book.getfoundry.sh/getting-started/installation)
-- Install dependencies: `forge install`
-- Build contracts: `forge build`
-- Test contracts: `forge test`
-
-If you intend to develop on this repo, follow the steps outlined in [CONTRIBUTING.md](CONTRIBUTING.md#install).
-
-## Deployment
-
-This repo utilizes versioned deployments. For more information on how to use forge scripts within the repo, check [here](CONTRIBUTING.md#deployment).
-
-Smart contracts are deployed or upgraded using the following command:
-
-```shell
-forge script script/Deploy.s.sol --broadcast --rpc-url <rpc_url> --verify
+```
+src/
+├── OTCSaleVault.sol              # Core vault (ERC4626 + bond + milestones)
+└── interfaces/
+    └── IOTCSaleVault.sol         # Interface, structs, errors, events
 ```
 
-## Docs
+## Vault + CCA Lifecycle
 
-The documentation and architecture diagrams for the contracts within this repo can be found [here](docs/).
-Detailed documentation generated from the NatSpec documentation of the contracts can be found [here](docs/autogen/src/src/).
-When exploring the contracts within this repository, it is recommended to start with the interfaces first and then move on to the implementation as outlined [here](CONTRIBUTING.md#natspec--comments)
+```mermaid
+sequenceDiagram
+    participant Deployer
+    participant Vault as OTCSaleVault
+    participant CCA as CCA Auction
+    participant Seller
+    participant Buyers
 
-## Contributing
+    Note over Deployer,CCA: Setup Phase
+    Deployer->>Vault: deploy(params)
+    Vault-->>Deployer: mint totalShares to deployer
+    Deployer->>CCA: initializeDistribution(vault as auctionToken)
+    Deployer->>CCA: transfer shares into auction
 
-If you want to contribute to this project, please check [CONTRIBUTING.md](CONTRIBUTING.md) first.
+    Note over Seller,Buyers: Auction Phase
+    Buyers->>CCA: bid (deposit paymentToken)
+    CCA-->>Buyers: distribute vault shares on claim
+    CCA-->>Vault: sweepUnsoldTokens
+
+    Note over Vault: Settlement
+    Vault->>Vault: settle() burn unsold, scale milestones
+
+    Note over Seller,Buyers: Vesting Phase
+    Seller->>Vault: postBond()
+    loop Each Milestone
+        Seller->>Vault: depositVesting(amount)
+        Vault->>Vault: unlockMilestone(i)
+        Buyers->>Vault: redeem(shares) → underlying tokens
+    end
+    Seller->>Vault: reclaimBond() (after final milestone)
+```
+
+## Default + Recovery Flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active: deploy + settle
+
+    Active --> MilestoneUnlocked: "deadline passed, deposits sufficient"
+    MilestoneUnlocked --> Active: buyers redeem shares
+
+    Active --> Defaulted: "missed milestone or bond not posted"
+    MilestoneUnlocked --> Defaulted: missed next milestone
+
+    Defaulted --> BondClaim: claimBond(shares)
+    Defaulted --> UnderlyingRecovery: withdrawOnDefault(shares)
+
+    Active --> BondReclaimed: all milestones fulfilled
+    BondReclaimed --> [*]
+    BondClaim --> [*]
+    UnderlyingRecovery --> [*]
+```
+
+## Key Accounting Details
+
+| Concern | Mechanism |
+|---|---|
+| Redemption tracking | Explicit `$totalAssetsWithdrawn` counter (immune to donation attacks) |
+| Bond payout denominator | `$defaultCirculatingSupply` snapshot at time of default (no stranded funds) |
+| Unsold shares | `settle()` burns them, scales milestone obligations proportionally |
+| Post-default underlying | `withdrawOnDefault()` lets holders recover already-deposited tokens |
+| Bond + underlying | Holders can do both — use some shares for bond, others for underlying |
+
+## Deploy
+
+```bash
+# Set environment variables
+export UNDERLYING_TOKEN=0x...
+export SELLER=0x...
+export TOTAL_SHARES=1000000000000000000000000
+export BOND_TOKEN=0x...
+export BOND_AMOUNT=100000000000
+export BOND_DEADLINE=1700000000
+export MILESTONE_DEADLINES=1700100000,1700200000,1700300000
+export MILESTONE_AMOUNTS=250000000000000000000000,500000000000000000000000,1000000000000000000000000
+
+forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast
+```
+
+Shares are minted to the deployer. Next steps after deploy:
+1. Approve vault shares to the CCA auction contract
+2. Call `initializeDistribution` on the CCA with the vault as `auctionToken`
+
+## Build & Test
+
+```bash
+forge build
+forge test
+```
