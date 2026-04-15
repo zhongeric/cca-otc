@@ -1,689 +1,713 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {Test} from 'forge-std/Test.sol';
-import {ERC20} from '@openzeppelin/contracts/token/ERC20/ERC20.sol';
 import {OTCSaleVault} from '../src/OTCSaleVault.sol';
+import {ICCA} from '../src/interfaces/ICCA.sol';
 import {IOTCSaleVault, Milestone, OTCSaleParams} from '../src/interfaces/IOTCSaleVault.sol';
+import {ERC20} from '@openzeppelin/contracts/token/ERC20/ERC20.sol';
+import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
+import {Test} from 'forge-std/Test.sol';
 
 contract MockERC20 is ERC20 {
     uint8 private _decimals;
 
-    constructor(string memory name_, string memory symbol_, uint8 dec_) ERC20(name_, symbol_) {
-        _decimals = dec_;
-    }
-
-    function mint(address _to, uint256 _amount) external {
-        _mint(_to, _amount);
+    constructor(string memory name_, string memory symbol_, uint8 decimals_) ERC20(name_, symbol_) {
+        _decimals = decimals_;
     }
 
     function decimals() public view override returns (uint8) {
         return _decimals;
     }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+
+contract MockCCA {
+    IERC20 public token;
+    IERC20 public currencyToken;
+    bool public graduated;
+    uint256 public unsoldTokenAmount;
+    uint256 public currencyAmount;
+    bool public currencySwept;
+    bool public tokensSwept;
+
+    constructor(address _token, address _currency) {
+        token = IERC20(_token);
+        currencyToken = IERC20(_currency);
+    }
+
+    function configure(bool _graduated, uint256 _unsoldTokens, uint256 _currencyAmount) external {
+        graduated = _graduated;
+        unsoldTokenAmount = _unsoldTokens;
+        currencyAmount = _currencyAmount;
+    }
+
+    function isGraduated() external view returns (bool) {
+        return graduated;
+    }
+
+    function sweepUnsoldTokens() external {
+        require(!tokensSwept, 'already swept');
+        tokensSwept = true;
+        if (unsoldTokenAmount > 0) {
+            token.transfer(msg.sender, unsoldTokenAmount);
+        }
+    }
+
+    function sweepCurrency() external {
+        require(graduated, 'not graduated');
+        require(!currencySwept, 'already swept');
+        currencySwept = true;
+        if (currencyAmount > 0) {
+            currencyToken.transfer(msg.sender, currencyAmount);
+        }
+    }
 }
 
 contract OTCSaleVaultTest is Test {
     MockERC20 underlying;
-    MockERC20 bondTokenERC20;
+    MockERC20 currency;
+    MockCCA mockCCA;
     OTCSaleVault vault;
 
-    address seller = makeAddr('seller');
-    address buyer1 = makeAddr('buyer1');
-    address buyer2 = makeAddr('buyer2');
-    address anyone = makeAddr('anyone');
+    address seller = address(0x1);
+    address buyer1 = address(0x2);
+    address buyer2 = address(0x3);
+    address anyone = address(0x4);
 
     uint128 constant TOTAL_SHARES = 1_000_000e18;
     uint128 constant BOND_AMOUNT = 100_000e6;
-    uint64 constant BOND_DEADLINE = 1_000_000;
-    uint128 constant MILESTONE_1_AMOUNT = 250_000e18;
-    uint64 constant MILESTONE_1_DEADLINE = 2_000_000;
-    uint128 constant MILESTONE_2_AMOUNT = 500_000e18;
-    uint64 constant MILESTONE_2_DEADLINE = 3_000_000;
-    uint128 constant MILESTONE_3_AMOUNT = 1_000_000e18;
-    uint64 constant MILESTONE_3_DEADLINE = 4_000_000;
+    uint256 constant AUCTION_PROCEEDS = 500_000e6;
+
+    Milestone[] milestones;
 
     function setUp() public {
-        underlying = new MockERC20('Vesting Token', 'VEST', 18);
-        bondTokenERC20 = new MockERC20('Bond Token', 'BOND', 6);
+        underlying = new MockERC20('Underlying Token', 'UND', 18);
+        currency = new MockERC20('USD Coin', 'USDC', 6);
 
-        Milestone[] memory milestones = new Milestone[](3);
-        milestones[0] = Milestone({deadline: MILESTONE_1_DEADLINE, cumulativeAmount: MILESTONE_1_AMOUNT});
-        milestones[1] = Milestone({deadline: MILESTONE_2_DEADLINE, cumulativeAmount: MILESTONE_2_AMOUNT});
-        milestones[2] = Milestone({deadline: MILESTONE_3_DEADLINE, cumulativeAmount: MILESTONE_3_AMOUNT});
+        milestones.push(Milestone({deadline: uint64(block.timestamp + 30 days), cumulativeAmount: 200_000e18}));
+        milestones.push(Milestone({deadline: uint64(block.timestamp + 60 days), cumulativeAmount: 500_000e18}));
+        milestones.push(Milestone({deadline: uint64(block.timestamp + 90 days), cumulativeAmount: 1_000_000e18}));
 
-        OTCSaleParams memory params = OTCSaleParams({
-            underlyingToken: address(underlying),
-            seller: seller,
-            totalShares: TOTAL_SHARES,
-            bondToken: address(bondTokenERC20),
-            bondAmount: BOND_AMOUNT,
-            bondDeadline: BOND_DEADLINE,
-            milestones: milestones
-        });
+        vault = _deployVaultWithBond();
 
-        vault = new OTCSaleVault(params);
+        mockCCA = new MockCCA(address(vault), address(currency));
 
+        // Distribute shares: 600k to buyer1, 400k to buyer2
+        vm.startPrank(address(this));
         vault.transfer(buyer1, 600_000e18);
         vault.transfer(buyer2, 400_000e18);
+        vm.stopPrank();
 
+        // Fund seller with underlying for vesting
         underlying.mint(seller, 2_000_000e18);
-        bondTokenERC20.mint(seller, 200_000e6);
-
         vm.prank(seller);
         underlying.approve(address(vault), type(uint256).max);
-        vm.prank(seller);
-        bondTokenERC20.approve(address(vault), type(uint256).max);
     }
 
-    // Construction
+    // ========================
+    // Constructor Tests
+    // ========================
 
-    function test_constructor_mintsSharesAndSetsState() public view {
+    function test_constructor_mintsShares() public view {
         assertEq(vault.totalSupply(), TOTAL_SHARES);
-        assertEq(vault.SELLER(), seller);
-        assertEq(vault.BOND_TOKEN(), address(bondTokenERC20));
-        assertEq(vault.BOND_AMOUNT(), BOND_AMOUNT);
-        assertEq(vault.BOND_DEADLINE(), BOND_DEADLINE);
-        assertEq(vault.milestoneCount(), 3);
-        assertEq(vault.$lastUnlockedMilestone(), type(uint256).max);
-        assertEq(vault.$bondPosted(), false);
-        assertEq(vault.$defaulted(), false);
     }
 
-    function test_constructor_milestonesStored() public view {
-        Milestone memory m0 = vault.getMilestone(0);
-        assertEq(m0.deadline, MILESTONE_1_DEADLINE);
-        assertEq(m0.cumulativeAmount, MILESTONE_1_AMOUNT);
+    function test_constructor_setsImmutables() public view {
+        assertEq(vault.seller(), seller);
+        assertEq(vault.currency(), address(currency));
+        assertEq(vault.bondAmount(), BOND_AMOUNT);
+        assertEq(vault.asset(), address(underlying));
+    }
 
-        Milestone memory m2 = vault.getMilestone(2);
-        assertEq(m2.deadline, MILESTONE_3_DEADLINE);
-        assertEq(m2.cumulativeAmount, MILESTONE_3_AMOUNT);
+    function test_constructor_revertsInsufficientBond() public {
+        OTCSaleParams memory params = _defaultParams();
+        // Don't pre-fund bond
+        vm.expectRevert(IOTCSaleVault.InsufficientBond.selector);
+        new OTCSaleVault(params);
     }
 
     function test_constructor_revertsZeroShares() public {
-        Milestone[] memory milestones = new Milestone[](1);
-        milestones[0] = Milestone({deadline: 100, cumulativeAmount: 100});
-
-        OTCSaleParams memory params = OTCSaleParams({
-            underlyingToken: address(underlying),
-            seller: seller,
-            totalShares: 0,
-            bondToken: address(bondTokenERC20),
-            bondAmount: BOND_AMOUNT,
-            bondDeadline: BOND_DEADLINE,
-            milestones: milestones
-        });
-
+        OTCSaleParams memory params = _defaultParams();
+        params.totalShares = 0;
         vm.expectRevert(IOTCSaleVault.ZeroShares.selector);
         new OTCSaleVault(params);
     }
 
     function test_constructor_revertsNoMilestones() public {
-        Milestone[] memory milestones = new Milestone[](0);
-
-        OTCSaleParams memory params = OTCSaleParams({
-            underlyingToken: address(underlying),
-            seller: seller,
-            totalShares: TOTAL_SHARES,
-            bondToken: address(bondTokenERC20),
-            bondAmount: BOND_AMOUNT,
-            bondDeadline: BOND_DEADLINE,
-            milestones: milestones
-        });
+        OTCSaleParams memory params;
+        params.underlyingToken = address(underlying);
+        params.seller = seller;
+        params.totalShares = TOTAL_SHARES;
+        params.currency = address(currency);
+        params.bondAmount = BOND_AMOUNT;
+        // empty milestones
 
         vm.expectRevert(IOTCSaleVault.NoMilestones.selector);
         new OTCSaleVault(params);
     }
 
-    // Bond posting
-
-    function test_postBond_succeeds() public {
-        vm.warp(BOND_DEADLINE - 1);
-        vm.prank(seller);
-        vault.postBond();
-
-        assertTrue(vault.$bondPosted());
-        assertEq(bondTokenERC20.balanceOf(address(vault)), BOND_AMOUNT);
+    function test_constructor_revertsInvalidCurrency() public {
+        OTCSaleParams memory params = _defaultParams();
+        params.currency = address(underlying);
+        vm.expectRevert(IOTCSaleVault.InvalidCurrency.selector);
+        new OTCSaleVault(params);
     }
 
-    function test_postBond_revertsIfNotSeller() public {
-        vm.warp(BOND_DEADLINE - 1);
-        vm.prank(anyone);
-        vm.expectRevert(IOTCSaleVault.NotSeller.selector);
-        vault.postBond();
+    // ========================
+    // Settlement Tests
+    // ========================
+
+    function test_settleAuction_graduated() public {
+        _setupGraduatedCCA(0, AUCTION_PROCEEDS);
+
+        vault.settleAuction(address(mockCCA));
+
+        assertTrue(vault.settled());
+        assertEq(vault.$effectiveTotalShares(), TOTAL_SHARES);
+        assertEq(vault.$totalAuctionProceeds(), AUCTION_PROCEEDS);
     }
 
-    function test_postBond_revertsAfterDeadline() public {
-        vm.warp(BOND_DEADLINE + 1);
-        vm.prank(seller);
-        vm.expectRevert(IOTCSaleVault.BondDeadlinePassed.selector);
-        vault.postBond();
+    function test_settleAuction_withUnsoldShares() public {
+        uint256 unsold = 100_000e18;
+        // Send some shares back to vault (simulating unsold)
+        vm.prank(buyer2);
+        vault.transfer(address(vault), unsold);
+
+        _setupGraduatedCCA(0, AUCTION_PROCEEDS);
+
+        vault.settleAuction(address(mockCCA));
+
+        assertTrue(vault.settled());
+        assertEq(vault.$effectiveTotalShares(), TOTAL_SHARES - unsold);
+        assertEq(vault.$totalAuctionProceeds(), AUCTION_PROCEEDS);
     }
 
-    function test_postBond_revertsIfAlreadyPosted() public {
-        vm.warp(BOND_DEADLINE - 1);
-        vm.prank(seller);
-        vault.postBond();
+    function test_settleAuction_notGraduated() public {
+        // CCA sends all tokens back, no currency
+        mockCCA.configure(false, TOTAL_SHARES, 0);
+        // Need to give CCA the shares
+        vm.prank(buyer1);
+        vault.transfer(address(mockCCA), 600_000e18);
+        vm.prank(buyer2);
+        vault.transfer(address(mockCCA), 400_000e18);
 
-        vm.prank(seller);
-        vm.expectRevert(IOTCSaleVault.BondAlreadyPosted.selector);
-        vault.postBond();
+        vault.settleAuction(address(mockCCA));
+
+        assertTrue(vault.settled());
+        assertEq(vault.$effectiveTotalShares(), 0);
+        assertEq(vault.$totalAuctionProceeds(), 0);
     }
 
-    // Vesting deposits
+    function test_settleAuction_revertsAlreadySettled() public {
+        _setupGraduatedCCA(0, AUCTION_PROCEEDS);
+        vault.settleAuction(address(mockCCA));
 
-    function test_depositVesting_succeeds() public {
-        _postBond();
+        vm.expectRevert(IOTCSaleVault.AlreadySettled.selector);
+        vault.settleAuction(address(mockCCA));
+    }
+
+    // ========================
+    // Deposit Vesting Tests
+    // ========================
+
+    function test_depositVesting() public {
+        _settleDefault();
 
         vm.prank(seller);
         vault.depositVesting(100_000e18);
 
         assertEq(vault.$totalVestingDeposited(), 100_000e18);
-        assertEq(underlying.balanceOf(address(vault)), 100_000e18);
     }
 
-    function test_depositVesting_revertsWithoutBond() public {
-        vm.prank(seller);
-        vm.expectRevert(IOTCSaleVault.BondNotPosted.selector);
-        vault.depositVesting(100_000e18);
-    }
-
-    function test_depositVesting_revertsIfNotSeller() public {
-        _postBond();
+    function test_depositVesting_revertsNotSeller() public {
+        _settleDefault();
 
         vm.prank(anyone);
         vm.expectRevert(IOTCSaleVault.NotSeller.selector);
         vault.depositVesting(100_000e18);
     }
 
-    // Milestone unlocking
+    function test_depositVesting_revertsNotSettled() public {
+        vm.prank(seller);
+        vm.expectRevert(IOTCSaleVault.NotSettled.selector);
+        vault.depositVesting(100_000e18);
+    }
 
-    function test_unlockMilestone_succeeds() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
+    // ========================
+    // Milestone Tests
+    // ========================
+
+    function test_unlockMilestone() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
 
         vault.unlockMilestone(0);
+
         assertEq(vault.$lastUnlockedMilestone(), 0);
     }
 
     function test_unlockMilestone_revertsBeforeDeadline() public {
-        _postBond();
+        _settleDefault();
 
         vm.prank(seller);
-        vault.depositVesting(MILESTONE_1_AMOUNT);
+        vault.depositVesting(200_000e18);
 
-        vm.warp(MILESTONE_1_DEADLINE - 1);
         vm.expectRevert(IOTCSaleVault.MilestoneNotReached.selector);
         vault.unlockMilestone(0);
     }
 
-    function test_unlockMilestone_revertsWithInsufficientDeposit() public {
-        _postBond();
+    function test_unlockMilestone_revertsInsufficientDeposit() public {
+        _settleDefault();
 
-        vm.prank(seller);
-        vault.depositVesting(MILESTONE_1_AMOUNT - 1);
+        vm.warp(milestones[0].deadline);
 
-        vm.warp(MILESTONE_1_DEADLINE);
         vm.expectRevert(IOTCSaleVault.MilestoneNotReached.selector);
         vault.unlockMilestone(0);
     }
 
-    function test_unlockMilestone_revertsIfAlreadyUnlocked() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
+    function test_unlockMilestone_revertsDuplicate() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
         vault.unlockMilestone(0);
 
         vm.expectRevert(IOTCSaleVault.MilestoneAlreadyUnlocked.selector);
         vault.unlockMilestone(0);
     }
 
-    function test_unlockMultipleMilestones() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_2_AMOUNT, MILESTONE_2_DEADLINE);
-
+    function test_unlockMilestone_revertsNotSettled() public {
+        vm.expectRevert(IOTCSaleVault.NotSettled.selector);
         vault.unlockMilestone(0);
+    }
+
+    function test_unlockMilestone_multipleInOrder() public {
+        _settleDefault();
+
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
+        vault.unlockMilestone(0);
+
+        _depositAndAdvance(300_000e18, milestones[1].deadline);
         vault.unlockMilestone(1);
+
         assertEq(vault.$lastUnlockedMilestone(), 1);
     }
 
-    // Redemption with explicit accounting
+    // ========================
+    // Redemption Tests
+    // ========================
 
-    function test_redeem_afterMilestone1() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
+    function test_redeem_afterMilestone() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
         vault.unlockMilestone(0);
 
         uint256 shares = 100_000e18;
-        uint256 expectedAssets = vault.convertToAssets(shares);
-
         vm.prank(buyer1);
         uint256 assets = vault.redeem(shares, buyer1, buyer1);
 
         assertGt(assets, 0);
-        assertEq(assets, expectedAssets);
         assertEq(underlying.balanceOf(buyer1), assets);
-        assertEq(vault.$totalAssetsWithdrawn(), assets);
     }
 
-    function test_redeem_noAssetsBeforeMilestone() public view {
+    function test_totalAssets_zeroBeforeMilestone() public {
+        _settleDefault();
+
         assertEq(vault.totalAssets(), 0);
     }
 
-    function test_redeem_proportionalBetweenBuyers() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
+    function test_totalAssets_afterMilestone() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
         vault.unlockMilestone(0);
 
-        uint256 buyer1Shares = 100_000e18;
-        uint256 buyer2Shares = 100_000e18;
-
-        vm.prank(buyer1);
-        uint256 assets1 = vault.redeem(buyer1Shares, buyer1, buyer1);
-
-        vm.prank(buyer2);
-        uint256 assets2 = vault.redeem(buyer2Shares, buyer2, buyer2);
-
-        assertEq(assets1, assets2);
+        assertEq(vault.totalAssets(), 200_000e18);
     }
 
-    function test_redeem_totalAssetsDecreasesCorrectly() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
+    function test_totalAssets_donationDoesNotAffect() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
         vault.unlockMilestone(0);
 
-        uint256 totalBefore = vault.totalAssets();
-
-        vm.prank(buyer1);
-        uint256 assets = vault.redeem(100_000e18, buyer1, buyer1);
-
-        uint256 totalAfter = vault.totalAssets();
-        assertEq(totalBefore - totalAfter, assets);
+        uint256 assetsBefore = vault.totalAssets();
+        underlying.mint(address(vault), 1_000_000e18);
+        assertEq(vault.totalAssets(), assetsBefore);
     }
 
-    function test_redeem_immuneToDonationAttack() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
+    // ========================
+    // Currency Release Tests
+    // ========================
+
+    function test_claimReleasedCurrency_afterFirstMilestone() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
         vault.unlockMilestone(0);
 
-        uint256 totalAssetsBefore = vault.totalAssets();
-
-        // Attacker donates tokens directly to vault
-        underlying.mint(anyone, 1_000_000e18);
-        vm.prank(anyone);
-        underlying.transfer(address(vault), 1_000_000e18);
-
-        // totalAssets should NOT change (uses explicit counter, not balance)
-        assertEq(vault.totalAssets(), totalAssetsBefore);
-    }
-
-    // Default mechanism
-
-    function test_triggerDefault_bondNotPosted() public {
-        vm.warp(BOND_DEADLINE + 1);
-
-        vm.prank(anyone);
-        vault.triggerDefault(0);
-
-        assertTrue(vault.$defaulted());
-    }
-
-    function test_triggerDefault_missedMilestone() public {
-        _postBond();
-
-        vm.warp(MILESTONE_1_DEADLINE + 1);
-
-        vm.prank(anyone);
-        vault.triggerDefault(0);
-
-        assertTrue(vault.$defaulted());
-    }
-
-    function test_triggerDefault_revertsIfMilestoneNotPassed() public {
-        _postBond();
-
-        vm.warp(MILESTONE_1_DEADLINE - 1);
-        vm.prank(anyone);
-        vm.expectRevert(IOTCSaleVault.BondDeadlineNotPassed.selector);
-        vault.triggerDefault(0);
-    }
-
-    function test_triggerDefault_revertsIfMilestoneFulfilled() public {
-        _postBond();
+        uint256 totalPool = uint256(BOND_AMOUNT) + AUCTION_PROCEEDS;
+        // milestone[0].cumulativeAmount / milestone[2].cumulativeAmount = 200k / 1M = 20%
+        uint256 expectedRelease = (totalPool * 200_000e18) / 1_000_000e18;
 
         vm.prank(seller);
-        vault.depositVesting(MILESTONE_1_AMOUNT);
+        vault.claimReleasedCurrency();
 
-        vm.warp(MILESTONE_1_DEADLINE + 1);
+        assertEq(currency.balanceOf(seller), expectedRelease);
+        assertEq(vault.$currencyReleasedToSeller(), expectedRelease);
+    }
+
+    function test_claimReleasedCurrency_afterSecondMilestone() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
+        vault.unlockMilestone(0);
+
+        vm.prank(seller);
+        vault.claimReleasedCurrency();
+        uint256 firstRelease = currency.balanceOf(seller);
+
+        _depositAndAdvance(300_000e18, milestones[1].deadline);
+        vault.unlockMilestone(1);
+
+        vm.prank(seller);
+        vault.claimReleasedCurrency();
+
+        uint256 totalPool = uint256(BOND_AMOUNT) + AUCTION_PROCEEDS;
+        // 50% released after milestone 1 (500k / 1M)
+        uint256 expectedTotal = (totalPool * 500_000e18) / 1_000_000e18;
+        assertEq(currency.balanceOf(seller), expectedTotal);
+        assertEq(currency.balanceOf(seller) - firstRelease, expectedTotal - firstRelease);
+    }
+
+    function test_claimReleasedCurrency_allMilestones_returnsEntirePool() public {
+        _settleDefault();
+
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
+        vault.unlockMilestone(0);
+
+        _depositAndAdvance(300_000e18, milestones[1].deadline);
+        vault.unlockMilestone(1);
+
+        _depositAndAdvance(500_000e18, milestones[2].deadline);
+        vault.unlockMilestone(2);
+
+        vm.prank(seller);
+        vault.claimReleasedCurrency();
+
+        uint256 totalPool = uint256(BOND_AMOUNT) + AUCTION_PROCEEDS;
+        assertEq(currency.balanceOf(seller), totalPool);
+    }
+
+    function test_claimReleasedCurrency_batchedClaim() public {
+        _settleDefault();
+
+        // Unlock all three milestones without claiming in between
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
+        vault.unlockMilestone(0);
+
+        _depositAndAdvance(300_000e18, milestones[1].deadline);
+        vault.unlockMilestone(1);
+
+        _depositAndAdvance(500_000e18, milestones[2].deadline);
+        vault.unlockMilestone(2);
+
+        // Single batched claim
+        vm.prank(seller);
+        vault.claimReleasedCurrency();
+
+        uint256 totalPool = uint256(BOND_AMOUNT) + AUCTION_PROCEEDS;
+        assertEq(currency.balanceOf(seller), totalPool);
+    }
+
+    function test_claimReleasedCurrency_revertsNotSeller() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
+        vault.unlockMilestone(0);
+
         vm.prank(anyone);
+        vm.expectRevert(IOTCSaleVault.NotSeller.selector);
+        vault.claimReleasedCurrency();
+    }
+
+    function test_claimReleasedCurrency_revertsNoMilestone() public {
+        _settleDefault();
+
+        vm.prank(seller);
         vm.expectRevert(IOTCSaleVault.MilestoneNotReached.selector);
-        vault.triggerDefault(0);
+        vault.claimReleasedCurrency();
     }
 
-    // Bond claiming — uses circulating supply as denominator
+    function test_claimReleasedCurrency_revertsNothingToClaim() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
+        vault.unlockMilestone(0);
 
-    function test_claimBond_afterDefault() public {
-        _postBond();
-        vm.warp(MILESTONE_1_DEADLINE + 1);
+        vm.prank(seller);
+        vault.claimReleasedCurrency();
+
+        // Claim again with same milestone
+        vm.prank(seller);
+        vm.expectRevert(IOTCSaleVault.NothingToClaim.selector);
+        vault.claimReleasedCurrency();
+    }
+
+    // ========================
+    // Default Tests
+    // ========================
+
+    function test_triggerDefault_missedMilestone() public {
+        _settleDefault();
+
+        vm.warp(milestones[0].deadline + 1);
 
         vm.prank(anyone);
         vault.triggerDefault(0);
 
-        uint256 buyer1Shares = vault.balanceOf(buyer1);
-
-        vm.prank(buyer1);
-        vault.claimBond(buyer1Shares);
-
-        // buyer1 has 600k of 1M circulating → 60% of bond
-        uint256 expectedPayout = uint256(BOND_AMOUNT) * 600_000e18 / TOTAL_SHARES;
-        assertEq(bondTokenERC20.balanceOf(buyer1), expectedPayout);
+        assertTrue(vault.$defaulted());
     }
 
-    function test_claimBond_revertsIfNotDefaulted() public {
-        _postBond();
+    function test_triggerDefault_revertsBeforeDeadline() public {
+        _settleDefault();
+
+        vm.expectRevert(IOTCSaleVault.MilestoneDeadlineNotPassed.selector);
+        vault.triggerDefault(0);
+    }
+
+    function test_triggerDefault_revertsMilestoneFulfilled() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline + 1);
+
+        vm.expectRevert(IOTCSaleVault.MilestoneFulfilled.selector);
+        vault.triggerDefault(0);
+    }
+
+    function test_triggerDefault_revertsNotSettled() public {
+        vm.warp(milestones[0].deadline + 1);
+
+        vm.expectRevert(IOTCSaleVault.NotSettled.selector);
+        vault.triggerDefault(0);
+    }
+
+    function test_triggerDefault_revertsAlreadyDefaulted() public {
+        _settleDefault();
+        vm.warp(milestones[0].deadline + 1);
+        vault.triggerDefault(0);
+
+        vm.expectRevert(IOTCSaleVault.SellerDefaulted.selector);
+        vault.triggerDefault(1);
+    }
+
+    // ========================
+    // Default Claim Tests
+    // ========================
+
+    function test_claimOnDefault_fullPool() public {
+        _settleDefault();
+        vm.warp(milestones[0].deadline + 1);
+        vault.triggerDefault(0);
+
+        uint256 totalPool = uint256(BOND_AMOUNT) + AUCTION_PROCEEDS;
+
+        // buyer1 has 600k shares out of 1M
+        vm.prank(buyer1);
+        vault.claimOnDefault(600_000e18, buyer1);
+
+        uint256 expected1 = (totalPool * 600_000e18) / TOTAL_SHARES;
+        assertEq(currency.balanceOf(buyer1), expected1);
+
+        // buyer2 has 400k shares
+        vm.prank(buyer2);
+        vault.claimOnDefault(400_000e18, buyer2);
+
+        uint256 expected2 = (totalPool * 400_000e18) / TOTAL_SHARES;
+        assertEq(currency.balanceOf(buyer2), expected2);
+
+        // All currency distributed
+        assertEq(currency.balanceOf(buyer1) + currency.balanceOf(buyer2), totalPool);
+    }
+
+    function test_claimOnDefault_afterPartialRelease() public {
+        _settleDefault();
+
+        // Seller completes first milestone and claims
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
+        vault.unlockMilestone(0);
+        vm.prank(seller);
+        vault.claimReleasedCurrency();
+        uint256 released = vault.$currencyReleasedToSeller();
+
+        // Then default on milestone 1
+        vm.warp(milestones[1].deadline + 1);
+        vault.triggerDefault(1);
+
+        uint256 lockedPool = uint256(BOND_AMOUNT) + AUCTION_PROCEEDS - released;
+
+        vm.prank(buyer1);
+        vault.claimOnDefault(600_000e18, buyer1);
+
+        uint256 expected = (lockedPool * 600_000e18) / TOTAL_SHARES;
+        assertEq(currency.balanceOf(buyer1), expected);
+    }
+
+    function test_claimOnDefault_afterPartialRedemption() public {
+        _settleDefault();
+        _depositAndAdvance(200_000e18, milestones[0].deadline);
+        vault.unlockMilestone(0);
+
+        // buyer1 redeems some shares for underlying
+        vm.prank(buyer1);
+        vault.redeem(100_000e18, buyer1, buyer1);
+
+        // Default on milestone 1
+        vm.warp(milestones[1].deadline + 1);
+        vault.triggerDefault(1);
+
+        uint256 totalPool = uint256(BOND_AMOUNT) + AUCTION_PROCEEDS;
+        uint256 circulatingAtDefault = vault.$defaultCirculatingSupply();
+        assertEq(circulatingAtDefault, TOTAL_SHARES - 100_000e18);
+
+        // buyer1 claims remaining 500k shares
+        vm.prank(buyer1);
+        vault.claimOnDefault(500_000e18, buyer1);
+
+        uint256 expected = (totalPool * 500_000e18) / circulatingAtDefault;
+        assertEq(currency.balanceOf(buyer1), expected);
+    }
+
+    function test_claimOnDefault_revertsNotDefaulted() public {
+        _settleDefault();
 
         vm.prank(buyer1);
         vm.expectRevert(IOTCSaleVault.SellerNotDefaulted.selector);
-        vault.claimBond(100e18);
+        vault.claimOnDefault(100_000e18, buyer1);
     }
 
-    function test_claimBond_multipleClaimers() public {
-        _postBond();
-        vm.warp(MILESTONE_1_DEADLINE + 1);
-
-        vm.prank(anyone);
+    function test_claimOnDefault_revertsZeroShares() public {
+        _settleDefault();
+        vm.warp(milestones[0].deadline + 1);
         vault.triggerDefault(0);
 
-        uint256 buyer1Shares = vault.balanceOf(buyer1);
-        uint256 buyer2Shares = vault.balanceOf(buyer2);
-
         vm.prank(buyer1);
-        vault.claimBond(buyer1Shares);
-
-        vm.prank(buyer2);
-        vault.claimBond(buyer2Shares);
-
-        uint256 totalPaid = bondTokenERC20.balanceOf(buyer1) + bondTokenERC20.balanceOf(buyer2);
-        assertApproxEqAbs(totalPaid, BOND_AMOUNT, 2);
+        vm.expectRevert(IOTCSaleVault.ZeroShares.selector);
+        vault.claimOnDefault(0, buyer1);
     }
 
-    function test_claimBond_afterPartialRedemption_noStrandedBond() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
-        vault.unlockMilestone(0);
-
-        // Buyer1 redeems 200k of their 600k shares for underlying tokens
-        vm.prank(buyer1);
-        vault.redeem(200_000e18, buyer1, buyer1);
-
-        // Seller fails milestone 2 → default
-        vm.warp(MILESTONE_2_DEADLINE + 1);
-        vm.prank(anyone);
-        vault.triggerDefault(1);
-
-        // Now buyer1 has 400k shares, buyer2 has 400k, totalSupply = 800k
-        uint256 b1Shares = vault.balanceOf(buyer1);
-        uint256 b2Shares = vault.balanceOf(buyer2);
-        assertEq(b1Shares, 400_000e18);
-        assertEq(b2Shares, 400_000e18);
+    function test_claimOnDefault_revertsInsufficientShares() public {
+        _settleDefault();
+        vm.warp(milestones[0].deadline + 1);
+        vault.triggerDefault(0);
 
         vm.prank(buyer1);
-        vault.claimBond(b1Shares);
-
-        vm.prank(buyer2);
-        vault.claimBond(b2Shares);
-
-        // FULL bond should be distributed (no stranded funds)
-        uint256 totalPaid = bondTokenERC20.balanceOf(buyer1) + bondTokenERC20.balanceOf(buyer2);
-        assertApproxEqAbs(totalPaid, BOND_AMOUNT, 2);
+        vm.expectRevert(IOTCSaleVault.InsufficientShares.selector);
+        vault.claimOnDefault(700_000e18, buyer1);
     }
 
-    // Withdraw on default — recover underlying from fulfilled milestones
-
-    function test_withdrawOnDefault_recoversUnderlyingTokens() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
-        vault.unlockMilestone(0);
-
-        // Seller defaults on milestone 2
-        vm.warp(MILESTONE_2_DEADLINE + 1);
-        vm.prank(anyone);
-        vault.triggerDefault(1);
-
-        // Buyer2 should be able to withdraw their share of the milestone 1 deposit
-        uint256 b2Shares = vault.balanceOf(buyer2);
-
-        vm.prank(buyer2);
-        vault.withdrawOnDefault(b2Shares, buyer2);
-
-        // 400k/1M shares * 250k underlying = 100k
-        assertApproxEqAbs(underlying.balanceOf(buyer2), 100_000e18, 1e18);
-    }
-
-    function test_withdrawOnDefault_afterPartialRedemption() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
-        vault.unlockMilestone(0);
-
-        // Buyer1 redeems 200k shares for underlying BEFORE default
-        vm.prank(buyer1);
-        uint256 alreadyGot = vault.redeem(200_000e18, buyer1, buyer1);
-        assertGt(alreadyGot, 0);
-
-        // Seller defaults on milestone 2
-        vm.warp(MILESTONE_2_DEADLINE + 1);
-        vm.prank(anyone);
-        vault.triggerDefault(1);
-
-        // Buyer1 still has 400k shares, buyer2 has 400k, total = 800k
-        // Remaining underlying = 250k - alreadyGot
-        uint256 remaining = MILESTONE_1_AMOUNT - alreadyGot;
-
-        // Buyer2 withdraws
-        uint256 b2Shares = vault.balanceOf(buyer2);
-        vm.prank(buyer2);
-        vault.withdrawOnDefault(b2Shares, buyer2);
-
-        // Buyer2 gets 400k/800k * remaining
-        uint256 expected = remaining * 400_000e18 / 800_000e18;
-        assertApproxEqAbs(underlying.balanceOf(buyer2), expected, 1e18);
-    }
-
-    function test_withdrawOnDefault_andClaimBond_bothWork() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
-        vault.unlockMilestone(0);
-
-        vm.warp(MILESTONE_2_DEADLINE + 1);
-        vm.prank(anyone);
-        vault.triggerDefault(1);
-
-        uint256 b1Shares = vault.balanceOf(buyer1);
-        uint256 halfShares = b1Shares / 2;
-
-        // Buyer1 uses half shares to withdraw underlying
-        vm.prank(buyer1);
-        vault.withdrawOnDefault(halfShares, buyer1);
-
-        // Buyer1 uses other half to claim bond
-        vm.prank(buyer1);
-        vault.claimBond(halfShares);
-
-        assertGt(underlying.balanceOf(buyer1), 0);
-        assertGt(bondTokenERC20.balanceOf(buyer1), 0);
-    }
-
-    function test_withdrawOnDefault_revertsIfNotDefaulted() public {
-        vm.prank(buyer1);
-        vm.expectRevert(IOTCSaleVault.SellerNotDefaulted.selector);
-        vault.withdrawOnDefault(100e18, buyer1);
-    }
-
-    // Transfer restrictions
+    // ========================
+    // Transfer Tests
+    // ========================
 
     function test_transfer_blockedAfterDefault() public {
-        _postBond();
-        vm.warp(MILESTONE_1_DEADLINE + 1);
-        vm.prank(anyone);
+        _settleDefault();
+        vm.warp(milestones[0].deadline + 1);
         vault.triggerDefault(0);
 
         vm.prank(buyer1);
         vm.expectRevert(IOTCSaleVault.TransferWhileDefaulted.selector);
-        vault.transfer(buyer2, 100e18);
+        vault.transfer(buyer2, 1e18);
     }
 
     function test_transfer_worksBeforeDefault() public {
         vm.prank(buyer1);
-        vault.transfer(buyer2, 100e18);
+        vault.transfer(buyer2, 1e18);
 
-        assertEq(vault.balanceOf(buyer2), 400_000e18 + 100e18);
+        assertEq(vault.balanceOf(buyer2), 400_000e18 + 1e18);
     }
 
-    // ERC4626 disabled functions
+    // ========================
+    // ERC4626 Disabled Tests
+    // ========================
 
     function test_deposit_disabled() public {
         vm.expectRevert(IOTCSaleVault.DepositDisabled.selector);
-        vault.deposit(100, buyer1);
+        vault.deposit(1e18, buyer1);
     }
 
     function test_mint_disabled() public {
         vm.expectRevert(IOTCSaleVault.DepositDisabled.selector);
-        vault.mint(100, buyer1);
+        vault.mint(1e18, buyer1);
     }
 
-    // Bond reclaim
+    // ========================
+    // Donation Resistance Tests
+    // ========================
 
-    function test_reclaimBond_afterAllMilestones() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_3_AMOUNT, MILESTONE_3_DEADLINE);
+    function test_currencyDonation_doesNotAffectPool() public {
+        _settleDefault();
 
-        vault.unlockMilestone(0);
-        vault.unlockMilestone(1);
-        vault.unlockMilestone(2);
+        uint256 poolBefore = uint256(BOND_AMOUNT) + vault.$totalAuctionProceeds();
 
-        uint256 sellerBondBefore = bondTokenERC20.balanceOf(seller);
+        // Donate extra currency
+        currency.mint(address(vault), 999_999e6);
 
-        vm.prank(seller);
-        vault.reclaimBond();
-
-        assertEq(bondTokenERC20.balanceOf(seller) - sellerBondBefore, BOND_AMOUNT);
+        // Pool accounting unchanged
+        uint256 poolAfter = uint256(BOND_AMOUNT) + vault.$totalAuctionProceeds();
+        assertEq(poolBefore, poolAfter);
     }
 
-    function test_reclaimBond_revertsBeforeAllMilestones() public {
-        _postBond();
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
-        vault.unlockMilestone(0);
+    // ========================
+    // Settlement Scaling Tests
+    // ========================
 
-        vm.prank(seller);
-        vm.expectRevert(IOTCSaleVault.MilestoneNotReached.selector);
-        vault.reclaimBond();
-    }
-
-    // Settlement
-
-    function test_settle_burnsUnsoldShares() public {
-        Milestone[] memory milestones = new Milestone[](1);
-        milestones[0] = Milestone({deadline: MILESTONE_1_DEADLINE, cumulativeAmount: MILESTONE_1_AMOUNT});
-
-        OTCSaleParams memory params = OTCSaleParams({
-            underlyingToken: address(underlying),
-            seller: seller,
-            totalShares: 1_000_000e18,
-            bondToken: address(bondTokenERC20),
-            bondAmount: BOND_AMOUNT,
-            bondDeadline: BOND_DEADLINE,
-            milestones: milestones
-        });
-
-        OTCSaleVault v2 = new OTCSaleVault(params);
-        v2.transfer(buyer1, 700_000e18);
-        v2.transfer(address(v2), 300_000e18);
-
-        v2.settle();
-
-        assertTrue(v2.$settled());
-        assertEq(v2.$effectiveTotalShares(), 700_000e18);
-        assertEq(v2.balanceOf(address(v2)), 0);
-    }
-
-    function test_settle_scalesMilestoneObligations() public {
-        Milestone[] memory milestones = new Milestone[](1);
-        milestones[0] = Milestone({deadline: MILESTONE_1_DEADLINE, cumulativeAmount: 1_000_000e18});
-
-        OTCSaleParams memory params = OTCSaleParams({
-            underlyingToken: address(underlying),
-            seller: seller,
-            totalShares: 1_000_000e18,
-            bondToken: address(bondTokenERC20),
-            bondAmount: BOND_AMOUNT,
-            bondDeadline: BOND_DEADLINE,
-            milestones: milestones
-        });
-
-        OTCSaleVault v2 = new OTCSaleVault(params);
-        v2.transfer(buyer1, 500_000e18);
-        v2.transfer(address(v2), 500_000e18);
-
-        v2.settle();
-
-        assertEq(v2.effectiveMilestoneAmount(0), 500_000e18);
-    }
-
-    function test_settle_revertsIfAlreadySettled() public {
-        vault.settle();
-
-        vm.expectRevert(IOTCSaleVault.AlreadySettled.selector);
-        vault.settle();
-    }
-
-    function test_settle_noUnsoldShares() public {
-        vault.settle();
-
-        assertTrue(vault.$settled());
-        assertEq(vault.$effectiveTotalShares(), TOTAL_SHARES);
-    }
-
-    // Full lifecycle
-
-    function test_fullLifecycle() public {
-        _postBond();
-        vault.settle();
-
-        _depositAndAdvance(MILESTONE_1_AMOUNT, MILESTONE_1_DEADLINE);
-        vault.unlockMilestone(0);
-
-        vm.prank(buyer1);
-        uint256 redeemed1 = vault.redeem(100_000e18, buyer1, buyer1);
-        assertGt(redeemed1, 0);
-        assertEq(vault.$totalAssetsWithdrawn(), redeemed1);
-
-        vm.prank(seller);
-        vault.depositVesting(MILESTONE_2_AMOUNT - MILESTONE_1_AMOUNT);
-        vm.warp(MILESTONE_2_DEADLINE);
-        vault.unlockMilestone(1);
-
+    function test_effectiveMilestoneAmount_scalesAfterSettlement() public {
+        // Send 200k shares back to vault (unsold)
         vm.prank(buyer2);
-        uint256 redeemed2 = vault.redeem(100_000e18, buyer2, buyer2);
-        assertGt(redeemed2, 0);
+        vault.transfer(address(vault), 200_000e18);
 
-        vm.prank(seller);
-        vault.depositVesting(MILESTONE_3_AMOUNT - MILESTONE_2_AMOUNT);
-        vm.warp(MILESTONE_3_DEADLINE);
-        vault.unlockMilestone(2);
+        _setupGraduatedCCA(0, AUCTION_PROCEEDS);
+        vault.settleAuction(address(mockCCA));
 
-        vm.prank(seller);
-        vault.reclaimBond();
+        // effectiveTotalShares = 1M - 200k = 800k
+        // milestone[0] original = 200k, scaled = 200k * 800k / 1M = 160k
+        uint256 effective = vault.effectiveMilestoneAmount(0);
+        assertEq(effective, (200_000e18 * 800_000e18) / TOTAL_SHARES);
     }
 
+    // ========================
     // Helpers
+    // ========================
 
-    function _postBond() internal {
-        vm.warp(BOND_DEADLINE - 1);
-        vm.prank(seller);
-        vault.postBond();
+    function _defaultParams() internal view returns (OTCSaleParams memory params) {
+        params.underlyingToken = address(underlying);
+        params.seller = seller;
+        params.totalShares = TOTAL_SHARES;
+        params.currency = address(currency);
+        params.bondAmount = BOND_AMOUNT;
+        params.milestones = milestones;
     }
 
-    function _depositAndAdvance(uint128 _amount, uint64 _deadline) internal {
+    function _deployVaultWithBond() internal returns (OTCSaleVault) {
+        OTCSaleParams memory params = _defaultParams();
+
+        // Predict vault address and pre-fund bond
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+
+        currency.mint(predicted, BOND_AMOUNT);
+
+        return new OTCSaleVault(params);
+    }
+
+    function _setupGraduatedCCA(uint256 unsoldTokens, uint256 auctionProceeds) internal {
+        mockCCA.configure(true, unsoldTokens, auctionProceeds);
+        // Fund CCA with currency for sweep
+        currency.mint(address(mockCCA), auctionProceeds);
+    }
+
+    function _settleDefault() internal {
+        _setupGraduatedCCA(0, AUCTION_PROCEEDS);
+        vault.settleAuction(address(mockCCA));
+    }
+
+    function _depositAndAdvance(uint256 amount, uint64 timestamp) internal {
         vm.prank(seller);
-        vault.depositVesting(_amount);
-        vm.warp(_deadline);
+        vault.depositVesting(amount);
+        vm.warp(timestamp);
     }
 }

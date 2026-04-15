@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {ERC20} from '@openzeppelin/contracts/token/ERC20/ERC20.sol';
-import {ERC4626} from '@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol';
-import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import {IERC4626} from '@openzeppelin/contracts/interfaces/IERC4626.sol';
-import {IERC20Metadata} from '@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol';
-import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
-import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
+import {ICCA} from './interfaces/ICCA.sol';
 import {IOTCSaleVault, Milestone, OTCSaleParams} from './interfaces/IOTCSaleVault.sol';
+import {IERC4626} from '@openzeppelin/contracts/interfaces/IERC4626.sol';
+import {ERC20} from '@openzeppelin/contracts/token/ERC20/ERC20.sol';
+import {IERC20} from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
+import {ERC4626} from '@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol';
+import {IERC20Metadata} from '@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol';
+import {SafeERC20} from '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
+import {Math} from '@openzeppelin/contracts/utils/math/Math.sol';
 
 /// @title OTCSaleVault
 /// @custom:security-contact security@uniswap.org
 /// @notice ERC4626 vault representing claims on vested tokens, sold via CCA auction.
 ///         Shares are pre-minted at construction and transferred to the CCA auction contract.
-///         The vault starts empty; the seller deposits vesting tokens over time per milestones.
-///         A configurable bond protects buyers against seller default.
-/// @dev After the CCA auction ends, `settle()` must be called to burn any unsold shares
-///      and scale down the seller's milestone obligations proportionally.
-///      Accounting uses explicit counters ($totalAssetsWithdrawn) rather than balance checks
-///      to prevent donation/griefing attacks on the redemption math.
+///         The vault holds a unified currency pool (bond + auction proceeds) that is released
+///         to the seller proportionally as milestones are completed.
+///         On seller default, the remaining locked currency is claimable by share holders.
+/// @dev The bond must be sent to the vault address before deployment (e.g. via CREATE2).
+///      After the CCA auction ends, `settleAuction()` must be called to sweep funds,
+///      burn unsold shares, and record auction proceeds.
+///      Accounting uses explicit counters to prevent donation/griefing attacks.
 contract OTCSaleVault is ERC4626, IOTCSaleVault {
     using SafeERC20 for IERC20;
     using Math for uint256;
@@ -28,12 +30,10 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
 
     /// @notice The seller responsible for depositing vesting tokens
     address public immutable SELLER;
-    /// @notice The token used for the seller's bond
-    address public immutable BOND_TOKEN;
-    /// @notice The required bond amount
+    /// @notice The currency token used for the bond and auction proceeds
+    address public immutable CURRENCY;
+    /// @notice The required bond amount (part of the unified currency pool)
     uint128 public immutable BOND_AMOUNT;
-    /// @notice Deadline by which bond must be posted
-    uint64 public immutable BOND_DEADLINE;
     /// @notice Total shares minted at construction (before settlement)
     uint128 public immutable TOTAL_SHARES;
 
@@ -42,26 +42,26 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     /// @notice The vesting milestones
     Milestone[] private $_milestones;
 
-    /// @notice Whether the seller has posted the bond
-    bool public $bondPosted;
     /// @notice Whether the seller has defaulted
     bool public $defaulted;
     /// @notice Whether settlement has occurred
     bool public $settled;
-    /// @notice Whether the bond has been reclaimed by the seller
-    bool private $bondReclaimed;
     /// @notice Total vesting tokens deposited by the seller so far
     uint256 public $totalVestingDeposited;
     /// @notice Index of the latest unlocked milestone (type(uint256).max if none)
     uint256 public $lastUnlockedMilestone;
-    /// @notice Total shares burned across all operations (redemptions, bond claims, settlement)
+    /// @notice Total shares burned across all operations (redemptions, default claims, settlement)
     uint256 public $totalSharesBurned;
     /// @notice Effective total shares after settlement (equals TOTAL_SHARES until settle() is called)
     uint256 public $effectiveTotalShares;
     /// @notice Cumulative underlying tokens withdrawn via redeem/withdraw (explicit counter, not balance-based)
     uint256 public $totalAssetsWithdrawn;
-    /// @notice Circulating supply snapshot taken at time of default (used as bond payout denominator)
+    /// @notice Circulating supply snapshot taken at time of default (used as claim denominator)
     uint256 public $defaultCirculatingSupply;
+    /// @notice Total auction proceeds received from the CCA (set once at settlement)
+    uint256 public $totalAuctionProceeds;
+    /// @notice Cumulative currency released to the seller via claimReleasedCurrency
+    uint256 public $currencyReleasedToSeller;
 
     constructor(OTCSaleParams memory _params)
         ERC4626(IERC20(_params.underlyingToken))
@@ -72,13 +72,14 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     {
         if (_params.seller == address(0)) revert ZeroAddress();
         if (_params.underlyingToken == address(0)) revert ZeroAddress();
+        if (_params.currency == address(0)) revert ZeroAddress();
+        if (_params.currency == _params.underlyingToken) revert InvalidCurrency();
         if (_params.totalShares == 0) revert ZeroShares();
         if (_params.milestones.length == 0) revert NoMilestones();
 
         SELLER = _params.seller;
-        BOND_TOKEN = _params.bondToken == address(0) ? _params.underlyingToken : _params.bondToken;
+        CURRENCY = _params.currency;
         BOND_AMOUNT = _params.bondAmount;
-        BOND_DEADLINE = _params.bondDeadline;
         TOTAL_SHARES = _params.totalShares;
         $lastUnlockedMilestone = type(uint256).max;
         $effectiveTotalShares = _params.totalShares;
@@ -92,6 +93,8 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
             prevAmount = _params.milestones[i].cumulativeAmount;
             $_milestones.push(_params.milestones[i]);
         }
+
+        if (IERC20(_params.currency).balanceOf(address(this)) < _params.bondAmount) revert InsufficientBond();
 
         _mint(msg.sender, _params.totalShares);
     }
@@ -108,7 +111,7 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
         _;
     }
 
-    // Interface-required view functions
+    // Interface view functions
 
     /// @inheritdoc IOTCSaleVault
     function seller() external view override returns (address) {
@@ -116,8 +119,8 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     }
 
     /// @inheritdoc IOTCSaleVault
-    function bondToken() external view override returns (address) {
-        return BOND_TOKEN;
+    function currency() external view override returns (address) {
+        return CURRENCY;
     }
 
     /// @inheritdoc IOTCSaleVault
@@ -126,13 +129,8 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     }
 
     /// @inheritdoc IOTCSaleVault
-    function bondDeadline() external view override returns (uint64) {
-        return BOND_DEADLINE;
-    }
-
-    /// @inheritdoc IOTCSaleVault
-    function bondPosted() external view override returns (bool) {
-        return $bondPosted;
+    function settled() external view override returns (bool) {
+        return $settled;
     }
 
     /// @inheritdoc IOTCSaleVault
@@ -141,8 +139,13 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     }
 
     /// @inheritdoc IOTCSaleVault
-    function settled() external view override returns (bool) {
-        return $settled;
+    function totalAuctionProceeds() external view override returns (uint256) {
+        return $totalAuctionProceeds;
+    }
+
+    /// @inheritdoc IOTCSaleVault
+    function currencyReleasedToSeller() external view override returns (uint256) {
+        return $currencyReleasedToSeller;
     }
 
     /// @inheritdoc IOTCSaleVault
@@ -180,7 +183,6 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     /// @inheritdoc ERC4626
     /// @dev Returns the underlying tokens currently available for redemption.
     ///      Computed as min(deposited, unlocked milestone amount) minus tokens already withdrawn.
-    ///      Uses explicit $totalAssetsWithdrawn counter rather than balance checks.
     function totalAssets() public view override(ERC4626, IERC4626) returns (uint256) {
         if ($lastUnlockedMilestone == type(uint256).max) return 0;
 
@@ -191,21 +193,37 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
         return effectiveAssets > $totalAssetsWithdrawn ? effectiveAssets - $totalAssetsWithdrawn : 0;
     }
 
+    // Settlement
+
+    /// @inheritdoc IOTCSaleVault
+    function settleAuction(address auction) external override {
+        if ($settled) revert AlreadySettled();
+        ICCA cca = ICCA(auction);
+
+        cca.sweepUnsoldTokens();
+
+        if (cca.isGraduated()) {
+            uint256 balBefore = IERC20(CURRENCY).balanceOf(address(this));
+            cca.sweepCurrency();
+            $totalAuctionProceeds = IERC20(CURRENCY).balanceOf(address(this)) - balBefore;
+        }
+
+        uint256 unsoldShares = balanceOf(address(this));
+        if (unsoldShares > 0) {
+            $totalSharesBurned += unsoldShares;
+            _burn(address(this), unsoldShares);
+        }
+
+        $effectiveTotalShares = TOTAL_SHARES - unsoldShares;
+        $settled = true;
+        emit AuctionSettled(unsoldShares, $effectiveTotalShares, $totalAuctionProceeds);
+    }
+
     // Seller functions
 
     /// @inheritdoc IOTCSaleVault
-    function postBond() external override onlySeller notDefaulted {
-        if ($bondPosted) revert BondAlreadyPosted();
-        if (block.timestamp > BOND_DEADLINE) revert BondDeadlinePassed();
-
-        $bondPosted = true;
-        IERC20(BOND_TOKEN).safeTransferFrom(msg.sender, address(this), BOND_AMOUNT);
-        emit BondPosted(msg.sender, BOND_TOKEN, BOND_AMOUNT);
-    }
-
-    /// @inheritdoc IOTCSaleVault
     function depositVesting(uint256 _amount) external override onlySeller notDefaulted {
-        if (!$bondPosted) revert BondNotPosted();
+        if (!$settled) revert NotSettled();
 
         $totalVestingDeposited += _amount;
         IERC20(asset()).safeTransferFrom(msg.sender, address(this), _amount);
@@ -213,43 +231,28 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     }
 
     /// @inheritdoc IOTCSaleVault
-    function reclaimBond() external override onlySeller notDefaulted {
-        if (!$bondPosted) revert BondNotPosted();
-        if ($bondReclaimed) revert BondAlreadyReclaimed();
+    function claimReleasedCurrency() external override onlySeller notDefaulted {
+        if ($lastUnlockedMilestone == type(uint256).max) revert MilestoneNotReached();
 
-        uint256 lastIdx = $_milestones.length - 1;
-        if ($lastUnlockedMilestone != lastIdx) revert MilestoneNotReached();
-        if ($totalVestingDeposited < effectiveMilestoneAmount(lastIdx)) revert MilestoneNotReached();
+        uint256 totalPool = uint256(BOND_AMOUNT) + $totalAuctionProceeds;
+        uint256 lastCumulative = $_milestones[$_milestones.length - 1].cumulativeAmount;
+        uint256 currentCumulative = $_milestones[$lastUnlockedMilestone].cumulativeAmount;
 
-        $bondReclaimed = true;
-        IERC20(BOND_TOKEN).safeTransfer(SELLER, BOND_AMOUNT);
-    }
+        uint256 totalReleasable = totalPool.mulDiv(currentCumulative, lastCumulative);
+        uint256 toRelease = totalReleasable - $currencyReleasedToSeller;
+        if (toRelease == 0) revert NothingToClaim();
 
-    // Settlement
-
-    /// @inheritdoc IOTCSaleVault
-    /// @dev Anyone can call this. Burns any shares held by this contract address (unsold shares
-    ///      returned from the CCA via sweepUnsoldTokens). Scales milestone obligations down
-    ///      proportionally so the seller only owes tokens for shares that were actually sold.
-    function settle() external override {
-        if ($settled) revert AlreadySettled();
-
-        uint256 unsoldShares = balanceOf(address(this));
-        $settled = true;
-
-        if (unsoldShares > 0) {
-            $totalSharesBurned += unsoldShares;
-            _burn(address(this), unsoldShares);
-        }
-
-        $effectiveTotalShares = TOTAL_SHARES - unsoldShares;
-        emit Settled(unsoldShares, $effectiveTotalShares);
+        $currencyReleasedToSeller += toRelease;
+        IERC20(CURRENCY).safeTransfer(SELLER, toRelease);
+        emit CurrencyReleased(SELLER, toRelease);
     }
 
     // Milestone management
 
     /// @inheritdoc IOTCSaleVault
     function unlockMilestone(uint256 _milestoneIndex) external override notDefaulted {
+        if (!$settled) revert NotSettled();
+
         Milestone memory m = $_milestones[_milestoneIndex];
         uint256 requiredAmount = effectiveMilestoneAmount(_milestoneIndex);
 
@@ -271,20 +274,11 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     /// @inheritdoc IOTCSaleVault
     function triggerDefault(uint256 _milestoneIndex) external override {
         if ($defaulted) revert SellerDefaulted();
-
-        if (!$bondPosted && block.timestamp > BOND_DEADLINE) {
-            $defaulted = true;
-            $defaultCirculatingSupply = totalSupply();
-            emit DefaultTriggered(msg.sender, type(uint256).max);
-            return;
-        }
-
-        if (!$bondPosted) revert BondNotPosted();
+        if (!$settled) revert NotSettled();
 
         Milestone memory m = $_milestones[_milestoneIndex];
-        uint256 requiredAmount = effectiveMilestoneAmount(_milestoneIndex);
-        if (block.timestamp <= m.deadline) revert BondDeadlineNotPassed();
-        if ($totalVestingDeposited >= requiredAmount) revert MilestoneNotReached();
+        if (block.timestamp <= m.deadline) revert MilestoneDeadlineNotPassed();
+        if ($totalVestingDeposited >= effectiveMilestoneAmount(_milestoneIndex)) revert MilestoneFulfilled();
 
         $defaulted = true;
         $defaultCirculatingSupply = totalSupply();
@@ -292,64 +286,34 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     }
 
     /// @inheritdoc IOTCSaleVault
-    /// @dev Bond payout is proportional to the share holder's claim on the REMAINING (circulating) supply.
-    ///      Uses totalSupply() (shares still in circulation) as the denominator so that shares already
-    ///      burned via redemption don't leave bond funds stranded. A holder who already redeemed some
-    ///      shares got their underlying tokens for those — they only claim bond for shares they still hold.
-    function claimBond(uint256 _shares) external override {
-        if (!$defaulted) revert SellerNotDefaulted();
-        if (_shares == 0) revert ZeroShares();
-        if (balanceOf(msg.sender) < _shares) revert InsufficientShares();
-        if (!$bondPosted || BOND_AMOUNT == 0) revert BondNotPosted();
-
-        uint256 payout = uint256(BOND_AMOUNT).mulDiv(_shares, $defaultCirculatingSupply);
-
-        $totalSharesBurned += _shares;
-        _burn(msg.sender, _shares);
-        IERC20(BOND_TOKEN).safeTransfer(msg.sender, payout);
-
-        emit BondSlashed(msg.sender, _shares, payout);
-    }
-
-    /// @inheritdoc IOTCSaleVault
-    /// @dev After default, share holders can still withdraw their pro-rata share of underlying
-    ///      tokens that were already deposited and unlocked before the default occurred.
-    ///      This is separate from claimBond — a holder can do both (withdraw underlying + claim bond).
-    function withdrawOnDefault(uint256 _shares, address _receiver) external override {
+    function claimOnDefault(uint256 _shares, address _receiver) external override {
         if (!$defaulted) revert SellerNotDefaulted();
         if (_shares == 0) revert ZeroShares();
         if (balanceOf(msg.sender) < _shares) revert InsufficientShares();
 
-        uint256 availableUnderlying = _unlockedAssetsRemaining();
-        if (availableUnderlying == 0) return;
-
-        uint256 assets = availableUnderlying.mulDiv(_shares, $defaultCirculatingSupply);
-        if (assets == 0) return;
+        uint256 lockedCurrency = uint256(BOND_AMOUNT) + $totalAuctionProceeds - $currencyReleasedToSeller;
+        uint256 payout = lockedCurrency.mulDiv(_shares, $defaultCirculatingSupply);
 
         $totalSharesBurned += _shares;
-        $totalAssetsWithdrawn += assets;
         _burn(msg.sender, _shares);
-        IERC20(asset()).safeTransfer(_receiver, assets);
 
-        emit SharesRedeemed(msg.sender, _shares, assets);
+        if (payout > 0) IERC20(CURRENCY).safeTransfer(_receiver, payout);
+        emit DefaultClaimed(msg.sender, _shares, payout);
     }
 
     // ERC4626 overrides
 
     /// @inheritdoc ERC4626
-    /// @dev Disabled. Shares are pre-minted at construction.
     function deposit(uint256, address) public pure override(ERC4626, IERC4626) returns (uint256) {
         revert DepositDisabled();
     }
 
     /// @inheritdoc ERC4626
-    /// @dev Disabled. Shares are pre-minted at construction.
     function mint(uint256, address) public pure override(ERC4626, IERC4626) returns (uint256) {
         revert DepositDisabled();
     }
 
     /// @inheritdoc ERC4626
-    /// @dev Milestone-gated redemption. Burns shares proportionally and transfers underlying tokens.
     function redeem(uint256 _shares, address _receiver, address _owner)
         public
         override(ERC4626, IERC4626)
@@ -379,7 +343,6 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     }
 
     /// @inheritdoc ERC4626
-    /// @dev Milestone-gated withdrawal. Converts asset amount to shares and burns them.
     function withdraw(uint256 _assets, address _receiver, address _owner)
         public
         override(ERC4626, IERC4626)
@@ -412,7 +375,6 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
     }
 
     /// @dev Returns the underlying tokens from fulfilled milestones that haven't been withdrawn yet.
-    ///      Used by withdrawOnDefault so holders can reclaim underlying even after default.
     function _unlockedAssetsRemaining() internal view returns (uint256) {
         if ($lastUnlockedMilestone == type(uint256).max) return 0;
 
@@ -423,12 +385,10 @@ contract OTCSaleVault is ERC4626, IOTCSaleVault {
         return effectiveAssets > $totalAssetsWithdrawn ? effectiveAssets - $totalAssetsWithdrawn : 0;
     }
 
-    /// @dev Check that the caller is the seller
     function _checkSeller() internal view {
         if (msg.sender != SELLER) revert NotSeller();
     }
 
-    /// @dev Check that the vault has not defaulted
     function _checkNotDefaulted() internal view {
         if ($defaulted) revert SellerDefaulted();
     }
